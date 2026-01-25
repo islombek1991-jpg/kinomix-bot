@@ -1,23 +1,238 @@
 import os
-from telegram import Update
-from telegram.ext import Application, CommandHandler, ContextTypes
+import sqlite3
+from typing import List, Tuple
 
-BOT_TOKEN = os.getenv("BOT_TOKEN")
+from telegram import Update
+from telegram.constants import ParseMode
+from telegram.ext import (
+    Application,
+    CommandHandler,
+    ContextTypes,
+    MessageHandler,
+    filters,
+)
+
+# =======================
+# ENV
+# =======================
+BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
+DB_PATH = os.getenv("DB_PATH", "data.db").strip()
+
+# Adminlar: "5491302235,123456789"
+ADMIN_IDS: List[int] = []
+_raw_admins = os.getenv("ADMIN_IDS", "").strip()
+if _raw_admins:
+    for x in _raw_admins.split(","):
+        x = x.strip()
+        if x.isdigit():
+            ADMIN_IDS.append(int(x))
+
+# Majburiy obuna kanallari (ixtiyoriy): "@kanal1,@kanal2"
+FORCE_CHANNELS: List[str] = []
+_raw_channels = os.getenv("FORCE_CHANNELS", "").strip()
+if _raw_channels:
+    for ch in _raw_channels.split(","):
+        ch = ch.strip()
+        if ch:
+            FORCE_CHANNELS.append(ch)
+
+# Instagram (faqat ko'rsatish uchun)
+IG_LINK = os.getenv("IG_LINK", "").strip()
 
 if not BOT_TOKEN:
-    raise ValueError("BOT_TOKEN yo‘q. Railway Variables ga BOT_TOKEN qo‘ying.")
+    raise ValueError("BOT_TOKEN yo'q. Railway Variables ga BOT_TOKEN qo'ying.")
 
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(
-        "🎬 KinoMix TV botiga xush kelibsiz!\n\n"
-        "📌 Kino yoki serial kodini yuboring.\n"
-        "🔥 Eng yangi kinolar faqat bizda!"
+# =======================
+# DB
+# =======================
+def db_conn():
+    return sqlite3.connect(DB_PATH)
+
+def db_init():
+    with db_conn() as con:
+        cur = con.cursor()
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS movies (
+                code TEXT PRIMARY KEY,
+                title TEXT NOT NULL,
+                url   TEXT NOT NULL
+            )
+        """)
+        con.commit()
+
+def db_add_movie(code: str, title: str, url: str):
+    with db_conn() as con:
+        cur = con.cursor()
+        cur.execute(
+            "INSERT OR REPLACE INTO movies(code,title,url) VALUES(?,?,?)",
+            (code, title, url),
+        )
+        con.commit()
+
+def db_get_movie(code: str):
+    with db_conn() as con:
+        cur = con.cursor()
+        cur.execute("SELECT title, url FROM movies WHERE code=?", (code,))
+        return cur.fetchone()
+
+def db_list_movies(limit: int = 50) -> List[Tuple[str, str]]:
+    with db_conn() as con:
+        cur = con.cursor()
+        cur.execute("SELECT code, title FROM movies ORDER BY code LIMIT ?", (limit,))
+        return cur.fetchall()
+
+# =======================
+# Helpers
+# =======================
+def is_admin(user_id: int) -> bool:
+    # ADMIN_IDS bo'sh bo'lsa — faqat sen qo'shishni istasang: return user_id == 5491302235
+    if not ADMIN_IDS:
+        return True
+    return user_id in ADMIN_IDS
+
+async def check_force_sub(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
+    """
+    Telegram kanalga a'zo ekanini tekshiradi.
+    Eslatma: bot kanal(lar)da ADMIN bo'lishi kerak, aks holda tekshiruv ishlamasligi mumkin.
+    """
+    if not FORCE_CHANNELS:
+        return True
+
+    user = update.effective_user
+    if not user or not update.message:
+        return False
+
+    not_joined = []
+    for ch in FORCE_CHANNELS:
+        try:
+            member = await context.bot.get_chat_member(ch, user.id)
+            if member.status in ("left", "kicked"):
+                not_joined.append(ch)
+        except Exception:
+            # Kanal topilmasa yoki bot admin bo'lmasa -> majburiy obuna ishlamaydi
+            not_joined.append(ch)
+
+    if not_joined:
+        lines = [f"👉 {c}" for c in not_joined]
+        ig = f"\n\n📸 Instagram: {IG_LINK}" if IG_LINK else ""
+        text = (
+            "🔒 Botdan foydalanish uchun quyidagi kanal(lar)ga obuna bo‘ling:\n\n"
+            + "\n".join(lines)
+            + ig
+            + "\n\n✅ Obuna bo‘lgach /start bosing."
+        )
+        await update.message.reply_text(text, disable_web_page_preview=True)
+        return False
+
+    return True
+
+def build_start_text() -> str:
+    ig = f"\n📸 Instagram: {IG_LINK}" if IG_LINK else ""
+    channels = ""
+    if FORCE_CHANNELS:
+        channels = "\n".join([f"• {c}" for c in FORCE_CHANNELS])
+        channels = f"\n\n📌 Kanal(lar):\n{channels}"
+    return (
+        "🎬 *KinoMix Bot* — kino/seriallarni kod bilan topish!\n\n"
+        "🧩 *Qanday ishlaydi?*\n"
+        "1) Kod yuborasiz (masalan: `4`)\n"
+        "2) Bot sizga kino linkini qaytaradi\n\n"
+        "🛠 Admin: `/add kod | nom | link`\n"
+        "Misol: `/add 4 | Troll | https://t.me/IsboySkinolar_olami/4`"
+        + channels
+        + ig
     )
 
+# =======================
+# Handlers
+# =======================
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.message and not await check_force_sub(update, context):
+        return
+    await update.message.reply_text(build_start_text(), parse_mode=ParseMode.MARKDOWN)
+
+async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(
+        "📌 Buyruqlar:\n"
+        "/start — boshlash\n"
+        "/help — yordam\n"
+        "/list — 50 ta kino ro‘yxati\n\n"
+        "🛠 Admin:\n"
+        "/add <kod> | <nom> | <link>\n"
+        "Misol: /add 4 | Troll | https://t.me/IsboySkinolar_olami/4"
+    )
+
+async def list_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.message and not await check_force_sub(update, context):
+        return
+    rows = db_list_movies(50)
+    if not rows:
+        await update.message.reply_text("Hozircha kino yo‘q. Admin /add bilan qo‘shadi.")
+        return
+    text = "📃 Kino ro‘yxati:\n" + "\n".join([f"{c} — {t}" for c, t in rows])
+    await update.message.reply_text(text)
+
+async def add_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    msg = update.message
+    if not msg:
+        return
+
+    if not is_admin(msg.from_user.id):
+        await msg.reply_text("⛔ Admin emassiz.")
+        return
+
+    raw = (msg.text or "").replace("/add", "", 1).strip()
+    parts = [p.strip() for p in raw.split("|")]
+    if len(parts) != 3:
+        await msg.reply_text(
+            "❌ Noto‘g‘ri format.\n"
+            "To‘g‘risi: /add <kod> | <nom> | <link>\n"
+            "Misol: /add 4 | Troll | https://t.me/IsboySkinolar_olami/4"
+        )
+        return
+
+    code, title, url = parts
+    if not code:
+        await msg.reply_text("❌ Kod bo‘sh bo‘lmasin.")
+        return
+    if not (url.startswith("http://") or url.startswith("https://") or url.startswith("t.me/")):
+        await msg.reply_text("❌ Link noto‘g‘ri. https://... bo‘lsin.")
+        return
+
+    db_add_movie(code, title, url)
+    await msg.reply_text(f"✅ Qo‘shildi: {code} — {title}")
+
+async def code_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    msg = update.message
+    if not msg:
+        return
+
+    if not await check_force_sub(update, context):
+        return
+
+    text = (msg.text or "").strip()
+    if not text or text.startswith("/"):
+        return
+
+    row = db_get_movie(text)
+    if not row:
+        await msg.reply_text("❌ Bunday kod topilmadi.")
+        return
+
+    title, url = row
+    await msg.reply_text(f"🎬 {title}\n🔗 {url}", disable_web_page_preview=False)
+
 def main():
+    db_init()
     app = Application.builder().token(BOT_TOKEN).build()
+
     app.add_handler(CommandHandler("start", start))
-    app.run_polling()
+    app.add_handler(CommandHandler("help", help_cmd))
+    app.add_handler(CommandHandler("list", list_cmd))
+    app.add_handler(CommandHandler("add", add_cmd))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, code_message))
+
+    app.run_polling(drop_pending_updates=True)
 
 if __name__ == "__main__":
     main()
